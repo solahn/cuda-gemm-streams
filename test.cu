@@ -4,7 +4,8 @@
 #include <cublas_v2.h>
 
 // 행렬 크기 정의
-#define N 1024
+#define N 4096
+#define BLOCK_SIZE 4096 // 간격
 
 // CUDA 오류 검사 함수
 #define CUDA_CHECK(err) if (err != cudaSuccess) { \
@@ -30,10 +31,9 @@ void gemm(cublasHandle_t handle, cudaStream_t stream, float* A, float* B, float*
 }
 
 int main() {
-    // 각 스트림마다 별도의 cuBLAS 핸들 생성
-    cublasHandle_t handle1, handle2;
-    CUBLAS_CHECK(cublasCreate(&handle1));
-    CUBLAS_CHECK(cublasCreate(&handle2));
+    // cuBLAS 핸들 및 CUDA 스트림 생성
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
 
     cudaStream_t stream1, stream2;
     CUDA_CHECK(cudaStreamCreate(&stream1));
@@ -47,7 +47,7 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&start2));
     CUDA_CHECK(cudaEventCreate(&stop2));
     CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventCreate(&stop)); // 괄호 수정
 
     // 호스트와 디바이스 메모리 할당
     float *h_A, *h_B, *h_C1, *h_C2;
@@ -55,10 +55,10 @@ int main() {
     float *d_A2, *d_B2, *d_C2;
     size_t size = N * N * sizeof(float);
 
-    h_A = (float*)malloc(size);  // 동일한 A 행렬을 사용
-    h_B = (float*)malloc(size);  // 동일한 B 행렬을 사용
-    h_C1 = (float*)malloc(size); // C1 결과 저장
-    h_C2 = (float*)malloc(size); // C2 결과 저장
+    h_A = (float*)malloc(size);
+    h_B = (float*)malloc(size);
+    h_C1 = (float*)malloc(size);
+    h_C2 = (float*)malloc(size);
 
     CUDA_CHECK(cudaMalloc(&d_A1, size));
     CUDA_CHECK(cudaMalloc(&d_B1, size));
@@ -74,30 +74,37 @@ int main() {
         h_B[i] = static_cast<float>(rand()) / RAND_MAX;
     }
 
-    // 행렬 데이터를 GPU로 복사 (비동기 복사)
-    CUDA_CHECK(cudaMemcpyAsync(d_A1, h_A, size, cudaMemcpyHostToDevice, stream1));
-    CUDA_CHECK(cudaMemcpyAsync(d_B1, h_B, size, cudaMemcpyHostToDevice, stream1));
-    CUDA_CHECK(cudaMemcpyAsync(d_A2, h_A, size, cudaMemcpyHostToDevice, stream2));
-    CUDA_CHECK(cudaMemcpyAsync(d_B2, h_B, size, cudaMemcpyHostToDevice, stream2));
-
     // 전체 타이머 시작
     CUDA_CHECK(cudaEventRecord(start, 0));
 
-    // 타이머 시작 (stream1)
-    auto startTime1 = std::chrono::high_resolution_clock::now(); // 시스템 시간 기록
-    CUDA_CHECK(cudaEventRecord(start1, stream1));
-    gemm(handle1, stream1, d_A1, d_B1, d_C1, N);  // 첫 번째 GEMM 연산
-    CUDA_CHECK(cudaEventRecord(stop1, stream1));
+    // N by N 행렬을 BLOCK_SIZE 단위로 나누어 계산
+    for (int i = 0; i < N; i += BLOCK_SIZE) {
+        int blockSize = (i + BLOCK_SIZE > N) ? (N - i) : BLOCK_SIZE;
 
-    // 타이머 시작 (stream2)
-    auto startTime2 = std::chrono::high_resolution_clock::now(); // 시스템 시간 기록
-    CUDA_CHECK(cudaEventRecord(start2, stream2));
-    gemm(handle2, stream2, d_A2, d_B2, d_C2, N);  // 두 번째 GEMM 연산
-    CUDA_CHECK(cudaEventRecord(stop2, stream2));
+        // 행렬 데이터를 GPU로 복사 (비동기 복사)
+        CUDA_CHECK(cudaMemcpyAsync(d_A1 + i * N, h_A + i * N, blockSize * N * sizeof(float), cudaMemcpyHostToDevice, stream1));
+        CUDA_CHECK(cudaMemcpyAsync(d_B1 + i * N, h_B + i * N, blockSize * N * sizeof(float), cudaMemcpyHostToDevice, stream1));
+        CUDA_CHECK(cudaMemcpyAsync(d_A2 + i * N, h_A + i * N, blockSize * N * sizeof(float), cudaMemcpyHostToDevice, stream2));
+        CUDA_CHECK(cudaMemcpyAsync(d_B2 + i * N, h_B + i * N, blockSize * N * sizeof(float), cudaMemcpyHostToDevice, stream2));
 
-    // 두 스트림 동기화
-    CUDA_CHECK(cudaStreamSynchronize(stream1));
-    CUDA_CHECK(cudaStreamSynchronize(stream2));
+        // 각 블록에 대해 GEMM 실행 및 시작 시간 기록
+        auto startTime1 = std::chrono::high_resolution_clock::now(); // 시스템 시간 기록
+        gemm(handle, stream1, d_A1 + i * N, d_B1 + i * N, d_C1 + i * N, blockSize);
+        auto endTime1 = std::chrono::high_resolution_clock::now();
+
+        auto startTime2 = std::chrono::high_resolution_clock::now(); // 시스템 시간 기록
+        gemm(handle, stream2, d_A2 + i * N, d_B2 + i * N, d_C2 + i * N, blockSize);
+        auto endTime2 = std::chrono::high_resolution_clock::now();
+
+        // 시작 시점 출력
+        auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(startTime1.time_since_epoch()).count();
+        auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(startTime2.time_since_epoch()).count();
+        std::cout << "Block starting at row " << i << " - Stream 1 Start Time: " << duration1 << " ms, Stream 2 Start Time: " << duration2 << " ms" << std::endl;
+
+        // 동기화
+        CUDA_CHECK(cudaStreamSynchronize(stream1));
+        CUDA_CHECK(cudaStreamSynchronize(stream2));
+    }
 
     // 전체 타이머 종료
     CUDA_CHECK(cudaEventRecord(stop, 0));
@@ -107,21 +114,8 @@ int main() {
     float totalTime = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&totalTime, start, stop));
 
-    // 두 스트림의 실행 시간 측정
-    float time1 = 0.0f, time2 = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&time1, start1, stop1));
-    CUDA_CHECK(cudaEventElapsedTime(&time2, start2, stop2));
-
-    // 시작 시점 출력
-    auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(startTime1.time_since_epoch()).count();
-    auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(startTime2.time_since_epoch()).count();
-    std::cout << "Stream 1 Start Time: " << duration1 << " ms" << std::endl;
-    std::cout << "Stream 2 Start Time: " << duration2 << " ms" << std::endl;
-
     // 실행 시간 출력
     std::cout << "Total Execution Time: " << totalTime << " ms" << std::endl;
-    std::cout << "Stream 1 (GEMM 1) Execution Time: " << time1 << " ms" << std::endl;
-    std::cout << "Stream 2 (GEMM 2) Execution Time: " << time2 << " ms" << std::endl;
 
     // 결과를 GPU에서 호스트로 복사 (비동기 복사)
     CUDA_CHECK(cudaMemcpyAsync(h_C1, d_C1, size, cudaMemcpyDeviceToHost, stream1));
@@ -146,9 +140,8 @@ int main() {
     CUDA_CHECK(cudaEventDestroy(start2));
     CUDA_CHECK(cudaEventDestroy(stop2));
     CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-    CUBLAS_CHECK(cublasDestroy(handle1));
-    CUBLAS_CHECK(cublasDestroy(handle2));
+    CUDA_CHECK(cudaEventDestroy(stop)); // 괄호 수정
+    CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaStreamDestroy(stream1));
     CUDA_CHECK(cudaStreamDestroy(stream2));
 
